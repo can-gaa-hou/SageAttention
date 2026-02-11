@@ -27,6 +27,20 @@ from .triton.attn_qk_int8_per_block_causal_varlen import forward as attn_true_va
 from .triton.quant_per_thread import per_thread_int8 as per_thread_int8_triton
 
 try:
+    from .triton_ascend.quant_per_block import per_block_int8 as per_block_int8_npu_triton
+    from .triton_ascend.attn_qk_int8_per_block import forward as attn_false_npu
+    from .triton_ascend.attn_qk_int8_per_block_causal import forward as attn_true_npu
+    NPU_TRITON_ENABLED = True
+except ImportError:
+    NPU_TRITON_ENABLED = False
+
+try:
+    import torch_npu
+    TORCH_NPU_AVAILABLE = True
+except ImportError:
+    TORCH_NPU_AVAILABLE = False
+
+try:
     from . import sm80_compile
     SM80_ENABLED = True
 except:
@@ -54,6 +68,28 @@ import warnings
 
 import subprocess
 import re
+
+
+def _get_device_type(tensor):
+    """Get the device type string of a tensor ('cuda', 'npu', etc.)."""
+    return tensor.device.type
+
+
+def _expand_attn_mask(attn_mask, q, k, tensor_layout):
+    """Expand attention mask to match the target shape for QK^T."""
+    if attn_mask is None:
+        return None
+    if tensor_layout == "HND":
+        target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+    elif tensor_layout == "NHD":
+        target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+    else:
+        raise ValueError(f"tensor_layout {tensor_layout} not supported")
+    try:
+        attn_mask = attn_mask.expand(target_shape)
+    except Exception:
+        raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
+    return attn_mask
 
 
 def get_cuda_version():
@@ -174,6 +210,9 @@ def sageattn_qk_int8_pv_fp16_triton(
     SageAttention with per-block INT8 quantization for Q and K, FP16 PV with FP16 accumulation, implemented using Triton.
     The FP16 accumulator is added to a FP32 buffer immediately after each iteration.
 
+    Supports both CUDA and Ascend NPU backends. When running on NPU, triton-ascend optimized kernels are used
+    automatically. Use ``quantization_backend="triton"`` for NPU devices.
+
     Parameters
     ----------
     q : torch.Tensor
@@ -198,6 +237,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     quantization_backend : str
         The quantization backend, either "triton" or "cuda".
         "cuda" backend offers better performance due to kernel fusion.
+        For NPU devices, only "triton" backend is supported.
 
     is_causal : bool
         Whether to apply causal mask to the attention matrix. Only applicable when qo_len == kv_len.
@@ -235,12 +275,18 @@ def sageattn_qk_int8_pv_fp16_triton(
     ----
     - ``num_qo_heads`` must be divisible by ``num_kv_heads``. 
     - The tensors `q`, `k`, and `v` must have the dtype ``torch.float16``, ``torch.bfloat16`` or ``torch.float32``.
-    - All tensors must be on the same cuda device.
+    - All tensors must be on the same device (cuda or npu).
     - `smooth_k` will introduce slight overhead but will improve the accuracy under most circumstances.
     """
 
     dtype = q.dtype
-    assert q.is_cuda, "Input tensors must be on cuda."
+    device_type = _get_device_type(q)
+    is_npu = device_type == "npu"
+
+    assert device_type in ("cuda", "npu"), "Input tensors must be on cuda or npu."
+    if is_npu:
+        assert NPU_TRITON_ENABLED, "triton_ascend kernels are not available. Make sure triton-ascend is installed."
+        assert TORCH_NPU_AVAILABLE, "torch_npu is not installed. Install torch_npu for NPU support."
     assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
@@ -255,7 +301,10 @@ def sageattn_qk_int8_pv_fp16_triton(
     # inference step in distributed env for multi gpus inference. This small
     # workaround also make sage attention work compatible with torch.compile
     # through non-fullgraph compile mode.
-    torch.cuda.set_device(v.device)
+    if is_npu:
+        torch.npu.set_device(v.device)
+    else:
+        torch.cuda.set_device(v.device)
 
     head_dim_og = q.size(-1)
 
@@ -300,28 +349,31 @@ def sageattn_qk_int8_pv_fp16_triton(
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim_og ** 0.5)
 
-    if quantization_backend == "triton":
+    if is_npu:
+        if quantization_backend != "triton":
+            raise ValueError(f"NPU only supports 'triton' quantization backend, got: {quantization_backend}")
+        q_int8, q_scale, k_int8, k_scale = per_block_int8_npu_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
+    elif quantization_backend == "triton":
         q_int8, q_scale, k_int8, k_scale = per_block_int8_triton(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     elif quantization_backend == "cuda":
         q_int8, q_scale, k_int8, k_scale = per_block_int8_cuda(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
     else:
         raise ValueError(f"Unsupported quantization backend: {quantization_backend}")
-    if is_causal:
-        assert attn_mask is None, "Mask should be None for causal attention."
-        o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+
+    if is_npu:
+        if is_causal:
+            assert attn_mask is None, "Mask should be None for causal attention."
+            o, lse = attn_true_npu(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        else:
+            attn_mask = _expand_attn_mask(attn_mask, q, k, tensor_layout)
+            o, lse = attn_false_npu(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
     else:
-        if attn_mask is not None:
-            if tensor_layout == "HND":
-                target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-            elif tensor_layout == "NHD":
-                target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-            else:
-                raise ValueError(f"tensor_layout {tensor_layout} not supported")
-            try:
-                attn_mask = attn_mask.expand(target_shape)
-            except Exception:
-                raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
-        o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
+        if is_causal:
+            assert attn_mask is None, "Mask should be None for causal attention."
+            o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
+        else:
+            attn_mask = _expand_attn_mask(attn_mask, q, k, tensor_layout)
+            o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
 
     o = o[..., :head_dim_og]
 
