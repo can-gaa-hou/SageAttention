@@ -35,6 +35,12 @@ except ImportError:
     NPU_TRITON_ENABLED = False
 
 try:
+    import torch_npu
+    TORCH_NPU_AVAILABLE = True
+except ImportError:
+    TORCH_NPU_AVAILABLE = False
+
+try:
     from . import sm80_compile
     SM80_ENABLED = True
 except:
@@ -67,6 +73,23 @@ import re
 def _get_device_type(tensor):
     """Get the device type string of a tensor ('cuda', 'npu', etc.)."""
     return tensor.device.type
+
+
+def _expand_attn_mask(attn_mask, q, k, tensor_layout):
+    """Expand attention mask to match the target shape for QK^T."""
+    if attn_mask is None:
+        return None
+    if tensor_layout == "HND":
+        target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
+    elif tensor_layout == "NHD":
+        target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
+    else:
+        raise ValueError(f"tensor_layout {tensor_layout} not supported")
+    try:
+        attn_mask = attn_mask.expand(target_shape)
+    except Exception:
+        raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
+    return attn_mask
 
 
 def get_cuda_version():
@@ -263,6 +286,7 @@ def sageattn_qk_int8_pv_fp16_triton(
     assert device_type in ("cuda", "npu"), "Input tensors must be on cuda or npu."
     if is_npu:
         assert NPU_TRITON_ENABLED, "triton_ascend kernels are not available. Make sure triton-ascend is installed."
+        assert TORCH_NPU_AVAILABLE, "torch_npu is not installed. Install torch_npu for NPU support."
     assert dtype in [torch.float16, torch.bfloat16], "Input tensors must be in dtype of torch.float16 or torch.bfloat16"
     assert q.device == k.device == v.device, "All tensors must be on the same device."
     assert q.dtype == k.dtype == v.dtype, "All tensors must have the same dtype."
@@ -278,7 +302,6 @@ def sageattn_qk_int8_pv_fp16_triton(
     # workaround also make sage attention work compatible with torch.compile
     # through non-fullgraph compile mode.
     if is_npu:
-        import torch_npu
         torch.npu.set_device(v.device)
     else:
         torch.cuda.set_device(v.device)
@@ -342,34 +365,14 @@ def sageattn_qk_int8_pv_fp16_triton(
             assert attn_mask is None, "Mask should be None for causal attention."
             o, lse = attn_true_npu(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
         else:
-            if attn_mask is not None:
-                if tensor_layout == "HND":
-                    target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-                elif tensor_layout == "NHD":
-                    target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-                else:
-                    raise ValueError(f"tensor_layout {tensor_layout} not supported")
-                try:
-                    attn_mask = attn_mask.expand(target_shape)
-                except Exception:
-                    raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
+            attn_mask = _expand_attn_mask(attn_mask, q, k, tensor_layout)
             o, lse = attn_false_npu(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
     else:
         if is_causal:
             assert attn_mask is None, "Mask should be None for causal attention."
             o, lse = attn_true(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, return_lse=return_lse)
         else:
-            if attn_mask is not None:
-                if tensor_layout == "HND":
-                    target_shape = (q.shape[0], q.shape[1], q.shape[2], k.shape[2])
-                elif tensor_layout == "NHD":
-                    target_shape = (q.shape[0], q.shape[2], q.shape[1], k.shape[1])
-                else:
-                    raise ValueError(f"tensor_layout {tensor_layout} not supported")
-                try:
-                    attn_mask = attn_mask.expand(target_shape)
-                except Exception:
-                    raise AssertionError(f"attn_mask shape {attn_mask.shape} cannot be broadcast to {target_shape}")
+            attn_mask = _expand_attn_mask(attn_mask, q, k, tensor_layout)
             o, lse = attn_false(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=dtype, attn_mask=attn_mask, return_lse=return_lse)
 
     o = o[..., :head_dim_og]
